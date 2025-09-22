@@ -1,0 +1,5 @@
+# requirements.txt
+
+prometheus_client
+numpy
+
