@@ -67,21 +67,38 @@ def _add_steps(store: Any, steps: List[Step]) -> None:
 
 
 def _list_steps(store: Any, goal_id: Optional[str] = None, statuses: Optional[Iterable[Status]] = None) -> List[Step]:
-    # Duck-typed set of store APIs
+    """
+    Duck-typed step lister.
+    Tries modern signatures that accept `statuses`, falls back to legacy ones.
+    """
+    # Preferred: steps_for(goal_id, *, statuses=...)
     if hasattr(store, "steps_for"):
-        return store.steps_for(goal_id, statuses=statuses)  # type: ignore[arg-type]
+        try:
+            return store.steps_for(goal_id, statuses=statuses)  # type: ignore[arg-type]
+        except TypeError:
+            # Legacy: steps_for(goal_id)
+            return store.steps_for(goal_id)
+
+    # Alternative: iter_steps() then filter here
     if hasattr(store, "iter_steps"):
         out: List[Step] = []
+        allowed = set(statuses) if statuses is not None else None
         for s in store.iter_steps():
             if goal_id and s.goal_id != goal_id:
                 continue
-            if statuses and s.status not in set(statuses):
+            if allowed is not None and s.status not in allowed:
                 continue
             out.append(s)
         return out
+
+    # Alternative: list_steps(...), possibly without statuses support
     if hasattr(store, "list_steps"):
-        return store.list_steps(goal_id=goal_id, statuses=statuses)
-    # If no step API is available yet, return empty to let you wire it later.
+        try:
+            return store.list_steps(goal_id=goal_id, statuses=statuses)
+        except TypeError:
+            return store.list_steps(goal_id=goal_id)
+
+    # If no step API available yet, return empty to let you wire it later.
     return []
 
 

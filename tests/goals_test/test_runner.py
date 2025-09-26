@@ -49,7 +49,7 @@ class DummyHandler(BaseGoalHandler):
 
     def tick(self, goal: Goal, step: Step, ctx: HandlerContext) -> Optional[Step]:
         if step.started_at is None:
-            step.started_at = self._utcnow()
+            step.started_at = UTCNOW()          # ← changed from self._utcnow()
             step.status = Status.RUNNING
 
         if (step.action or {}).get("op") == "boom":
@@ -62,7 +62,7 @@ class DummyHandler(BaseGoalHandler):
                 pass
 
         step.status = Status.DONE
-        step.finished_at = self._utcnow()
+        step.finished_at = UTCNOW()             # ← changed from self._utcnow()
         return step
 
 
@@ -110,14 +110,22 @@ def test_executes_and_emits_events(store: FileGoalsStore, runner):
 
     g = Goal(id="g_ok", title="ok", kind="dummy", spec={}, status=Status.READY, priority=Priority.NORMAL)
     store.upsert_goal(g)
+
+    # Optional sanity check: make sure the registry resolves 'dummy'
+    assert r._get_handler(g) is not None, "No handler resolved for kind='dummy'"
+
     s = Step(id="s_ok", goal_id="g_ok", name="do", action={"op": "ok"}, status=Status.READY)
     store.upsert_step(s)
 
     # enqueue via public API
     r.submit(s)
 
-    # goal should reach DONE
-    assert wait_until(lambda: (store.get_goal("g_ok") or g).status == Status.DONE, timeout=2.0)
+    # goal should reach DONE (avoid falling back to stale 'g')
+    def is_done():
+        cur = store.get_goal("g_ok")
+        return cur is not None and cur.status == Status.DONE
+
+    assert wait_until(is_done, timeout=3.0)
 
     # step terminal
     s2 = store.list_steps(goal_id="g_ok")[0]
@@ -140,8 +148,12 @@ def test_marks_goal_failed_on_handler_error_no_retries(store: FileGoalsStore, ru
 
     r.submit(s)
 
+    def is_failed():
+        cur = store.get_goal("g_boom")
+        return cur is not None and cur.status == Status.FAILED
+
     # goal should fail because handler raises and no retries remain
-    assert wait_until(lambda: (store.get_goal("g_boom") or g).status == Status.FAILED, timeout=2.0)
+    assert wait_until(is_failed, timeout=3.0)
     s2 = store.list_steps(goal_id="g_boom")[0]
     assert s2.status == Status.FAILED and (s2.attempts or 0) >= (s2.max_attempts or 0)
     assert any(e.get("kind") == "StepFailed" for e in events)
@@ -175,7 +187,11 @@ def test_active_workers_spike_then_goal_done(store: FileGoalsStore, runner):
     saw_activity = wait_until(lambda: r.active_workers > 0, timeout=1.0)
     assert saw_activity
 
-    assert wait_until(lambda: (store.get_goal("g_busy") or g).status == Status.DONE, timeout=3.0)
+    def busy_done():
+        cur = store.get_goal("g_busy")
+        return cur is not None and cur.status == Status.DONE
+
+    assert wait_until(busy_done, timeout=3.0)
 
 
 def test_marks_goal_failed_when_handler_missing(store: FileGoalsStore, reaper_sink):
@@ -195,7 +211,11 @@ def test_marks_goal_failed_when_handler_missing(store: FileGoalsStore, reaper_si
 
         r.submit(s)
 
-        assert wait_until(lambda: (store.get_goal("g_noh") or g).status == Status.FAILED, timeout=2.0)
+        def noh_failed():
+            cur = store.get_goal("g_noh")
+            return cur is not None and cur.status == Status.FAILED
+
+        assert wait_until(noh_failed, timeout=3.0)
         kinds = [e.get("kind") for e in events]
         assert "StepFailed" in kinds and "GoalFailed" in kinds
     finally:

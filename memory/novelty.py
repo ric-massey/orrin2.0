@@ -2,15 +2,55 @@
 # Novelty scoring for memory ingest: fast cosine-to-novelty with vector cache support and batch helpers (no external deps).
 
 from __future__ import annotations
-from typing import Iterable, List, Tuple, Optional
+from typing import Iterable, List, Optional
+import os
+import math
 import numpy as np
+
+try:
+    # Optional: mirror how embedder reads config
+    from .config import MEMCFG  # type: ignore
+except Exception:  # pragma: no cover
+    class _Dummy:
+        NOVELTY_FLOOR = 0.05
+        NOVELTY_TEMPERATURE = 1.0
+    MEMCFG = _Dummy()  # type: ignore
+
+
+# ---------- configurable defaults (overrideable at call time) ----------
+def _cfg_floor() -> float:
+    # Env wins, then MEMCFG, then hard default
+    v = os.getenv("MEMORY_NOVELTY_FLOOR")
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    try:
+        return float(getattr(MEMCFG, "NOVELTY_FLOOR", 0.05))
+    except Exception:
+        return 0.05
+
+def _cfg_temperature() -> float:
+    v = os.getenv("MEMORY_NOVELTY_TEMPERATURE")
+    if v is not None:
+        try:
+            return float(v)
+        except Exception:
+            pass
+    try:
+        return float(getattr(MEMCFG, "NOVELTY_TEMPERATURE", 1.0))
+    except Exception:
+        return 1.0
 
 
 # ---------- small utils ----------
 def _normalize(v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=np.float32).reshape(-1)
     n = float(np.linalg.norm(v))
-    return v if n == 0.0 else (v / n)
+    if not math.isfinite(n) or n == 0.0:
+        return np.zeros_like(v, dtype=np.float32)
+    return v / n
 
 def _as2d_norm(recent_vecs: Iterable[np.ndarray]) -> np.ndarray:
     """
@@ -20,7 +60,7 @@ def _as2d_norm(recent_vecs: Iterable[np.ndarray]) -> np.ndarray:
     mats: List[np.ndarray] = []
     for rv in recent_vecs:
         try:
-            mats.append(_normalize(rv))
+            mats.append(_normalize(np.asarray(rv, dtype=np.float32)))
         except Exception:
             continue
     if not mats:
@@ -32,10 +72,14 @@ def _as2d_norm(recent_vecs: Iterable[np.ndarray]) -> np.ndarray:
 
 # ---------- public API ----------
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity in [−1, 1]; safe for zero vectors."""
+    """Cosine similarity in [−1, 1]; safe for zero/NaN vectors."""
     va, vb = _normalize(a), _normalize(b)
     denom = (np.linalg.norm(va) * np.linalg.norm(vb)) + 1e-9
-    return float(np.dot(va, vb) / denom)
+    if not math.isfinite(denom) or denom <= 0:
+        return 0.0
+    s = float(np.dot(va, vb) / denom)
+    # Clamp to guard tiny numeric overshoots
+    return float(max(-1.0, min(1.0, s)))
 
 
 def max_cosine(vec: np.ndarray, recent_vecs: Iterable[np.ndarray]) -> float:
@@ -50,7 +94,7 @@ def max_cosine(vec: np.ndarray, recent_vecs: Iterable[np.ndarray]) -> float:
     # Cosine == dot because both sides are L2-normalized
     try:
         sims = M @ v
-        return float(np.max(sims))
+        m = float(np.max(sims))
     except Exception:
         # Fallback to loop if dims misaligned or matmul fails
         best = 0.0
@@ -58,7 +102,9 @@ def max_cosine(vec: np.ndarray, recent_vecs: Iterable[np.ndarray]) -> float:
             s = float(np.dot(r, v))
             if s > best:
                 best = s
-        return best
+        m = best
+    # Clamp to [-1,1]
+    return float(max(-1.0, min(1.0, m)))
 
 
 def novelty(
@@ -76,12 +122,20 @@ def novelty(
       - floor ensures we never fully suppress low-sim items in early life
 
     If there are no recent vectors, returns 1.0 (max novelty).
+
+    ENV/CONFIG overrides:
+      MEMORY_NOVELTY_FLOOR, MEMORY_NOVELTY_TEMPERATURE (or MEMCFG.NOVELTY_FLOOR/TEMPERATURE)
     """
-    if temperature <= 0:
-        temperature = 1.0
+    # Resolve effective params with override-at-call-time semantics
+    efloor = float(max(0.0, _cfg_floor()))
+    # Caller-provided floor still respected if higher than configured
+    efloor = float(max(efloor, floor))
+
+    etemp = float(max(1e-6, temperature if temperature is not None else _cfg_temperature()))
+
     m = max_cosine(vec, recent_vecs)
-    n = (1.0 - float(max(0.0, min(1.0, m)))) ** float(temperature)
-    n = float(max(float(floor), min(1.0, n)))
+    n = (1.0 - float(max(0.0, min(1.0, m)))) ** etemp
+    n = float(max(efloor, min(1.0, n)))
     return n
 
 
@@ -93,6 +147,11 @@ def novelty_many(
     temperature: float = 1.0,
 ) -> List[float]:
     """Batch novelty for a list of vectors against the same recent set."""
+    # Resolve effective params with override-at-call-time semantics
+    efloor = float(max(0.0, _cfg_floor()))
+    efloor = float(max(efloor, floor))
+    etemp = float(max(1e-6, temperature if temperature is not None else _cfg_temperature()))
+
     M = _as2d_norm(recent_vecs)
     out: List[float] = []
     if M.size == 0:
@@ -109,13 +168,14 @@ def novelty_many(
                 s = float(np.dot(r, vn))
                 if s > m:
                     m = s
-        n = (1.0 - float(max(0.0, min(1.0, m)))) ** float(max(temperature, 1e-6))
-        out.append(float(max(floor, min(1.0, n))))
+        m = float(max(-1.0, min(1.0, m)))
+        n = (1.0 - float(max(0.0, min(1.0, m)))) ** etemp
+        out.append(float(max(efloor, min(1.0, n))))
     return out
 
 
 # ---------- quick self-test ----------
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     rng = np.random.default_rng(42)
     base = _normalize(rng.normal(size=384))
     near = _normalize(base + 0.05 * rng.normal(size=384))

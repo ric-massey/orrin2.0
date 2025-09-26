@@ -85,6 +85,6 @@ def test_goal_overdue_true_false_cases():
 def test_goal_overdue_with_naive_deadline_is_safe():
     now = datetime.now(timezone.utc)
     # Naive (no tz) deadline; method should not raise and should return False due to safe-guard
-    naive_past = datetime.utcnow() - timedelta(hours=1)  # naive
+    naive_past = (datetime.now() - timedelta(hours=1)).replace(tzinfo=None)  # explicit naive
     g = Goal(id="gn", title="t", kind="k", spec={}, status=Status.READY, deadline=naive_past)
-    assert g.overdue(now) in (False, )  # specifically False in current implementation
+    assert g.overdue(now) in (False,)  # specifically False in current implementation

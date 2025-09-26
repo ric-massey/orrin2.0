@@ -52,7 +52,12 @@ class MemoryDaemon:
 
         # Working cache of items we most recently wrote at layer='working'
         self._working_cache: Dict[str, MemoryItem] = {}
-        self._last_compact_ts: float = 0.0
+
+        # Initialize compaction timestamp to "now" so health doesn't think it's stalled
+        self._last_compact_ts: float = time.time()
+
+        # Track WAL flush failures for health reporting
+        self._flush_failures: int = 0
 
         # Lexicon handler (definitions)
         self.lexicon = Lexicon(self.store)
@@ -63,6 +68,11 @@ class MemoryDaemon:
         if self.running:
             return
         self.running = True
+
+        # Safety: if something zeroed the ts before start, fix it
+        if not self._last_compact_ts:
+            self._last_compact_ts = time.time()
+
         self.thread = threading.Thread(target=self._loop, name="MemoryDaemon", daemon=True)
         self.thread.start()
 
@@ -157,6 +167,7 @@ class MemoryDaemon:
             try:
                 wal_append_event(ev)
             except Exception:
+                self._flush_failures += 1  # count WAL misses
                 pass
 
             # Build item (sanitize meta, precomputed _vec support, salience/novelty, kind priors)
@@ -189,6 +200,7 @@ class MemoryDaemon:
             try:
                 wal_append_items(batch_items)
             except Exception:
+                self._flush_failures += 1
                 pass
             note_item_upserts(len(batch_items))
 
@@ -215,10 +227,51 @@ class MemoryDaemon:
                 wal=DEFAULT_WAL,  # WAL promotions/summaries
             )
             self._working_cache.clear()
-            self._last_compact_ts = time.time()
+
+            # Update timestamp each time compaction runs
+            self.mark_compaction_now()
             note_compaction(stats, when_ts=self._last_compact_ts)
 
     # ----------------- Helpers -----------------
+
+    # Expose clean accessors for health/instrumentation
+    @property
+    def last_compaction_ts(self) -> float:
+        """UNIX seconds (float) of the last successful compaction (or daemon start)."""
+        return float(self._last_compact_ts or 0.0)
+
+    @property
+    def working_cache_size(self) -> int:
+        """How many items are in the working cache (pre-compaction)."""
+        return len(self._working_cache)
+
+    @property
+    def flush_failures(self) -> int:
+        """Number of WAL append failures observed since start."""
+        return int(self._flush_failures)
+
+    def mark_compaction_now(self) -> None:
+        """Set last compaction timestamp to 'now'."""
+        self._last_compact_ts = time.time()
+
+    def time_since_compaction_min(self) -> float:
+        """Minutes since last compaction (or start)."""
+        return max(0.0, (time.time() - float(self._last_compact_ts or 0.0)) / 60.0)
+
+    def get_health_hints(self) -> Dict[str, float | int]:
+        """
+        Small struct for dashboards:
+          - working_cache_size
+          - last_compaction_ts
+          - compaction_stalled_min (derived)
+          - flush_failures
+        """
+        return {
+            "working_cache_size": self.working_cache_size,
+            "last_compaction_ts": self.last_compaction_ts,
+            "compaction_stalled_min": self.time_since_compaction_min(),
+            "flush_failures": self.flush_failures,
+        }
 
     def _maybe_learn_definitions(self, ev: Event, text: str) -> None:
         """Scan text for definitional patterns and teach the lexicon."""
@@ -238,5 +291,4 @@ class MemoryDaemon:
                     source=ev.kind,
                 )
             except Exception:
-                # Don't let lexicon issues break ingest
                 continue

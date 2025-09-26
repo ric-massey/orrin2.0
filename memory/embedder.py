@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Union, List, Tuple, Optional
 from functools import lru_cache
 from pathlib import Path
+import os
 import io
 import hashlib
 import numpy as np
@@ -45,7 +46,7 @@ def _hash_text_cached(text: str, dim: int) -> np.ndarray:
     return _hash_vec(text.encode("utf-8", errors="ignore"), dim)
 
 def _ensure_bytes_image(image: Union[bytes, bytearray, memoryview, str, Path, "PIL.Image.Image"]) -> bytes:
-    # Accept raw bytes, path, or PIL.Image; return bytes (PNG) deterministically
+    # Accept raw bytes, path, or PIL.Image; return bytes deterministically
     if isinstance(image, (bytes, bytearray, memoryview)):
         return bytes(image)
     if isinstance(image, (str, Path)):
@@ -130,27 +131,85 @@ def text_dim() -> int:
 
 
 # ------------------------------
-# Image embedding (optional)
+# Image embedding (overrideable)
 # ------------------------------
+
+def _forced_img_backend() -> Optional[str]:
+    """
+    Returns "hash" or "hf" if explicitly forced via env; otherwise None.
+
+    Supported env flags (any one works):
+      - MEMORY_IMG_BACKEND=hash|hf
+      - MEMORY_IMG_DISABLE_HF=1  (forces hash)
+      - ORRIN_IMAGE_EMBED=hash|hf
+      - MEMORY_IMG_FORCE_HASH=1  (forces hash)
+      - PYTEST_FORCE_HASH_EMBEDDING=1  (handy in tests)
+    """
+    # canonical selector
+    forced = (os.getenv("MEMORY_IMG_BACKEND") or os.getenv("ORRIN_IMAGE_EMBED") or "").strip().lower()
+    if forced in {"hash", "hf"}:
+        return forced
+
+    # boolean switches that force hash
+    for flag in ("MEMORY_IMG_DISABLE_HF", "MEMORY_IMG_FORCE_HASH", "PYTEST_FORCE_HASH_EMBEDDING"):
+        v = (os.getenv(flag) or "").strip().lower()
+        if v in {"1", "true", "yes"}:
+            return "hash"
+
+    return None
+
+def _hash_img_dim() -> int:
+    """
+    Hash fallback embedding dimension. Floor to 32 (tests expect a minimum).
+    Env override: MEMORY_IMG_HASH_DIM
+    """
+    try:
+        env_dim = os.getenv("MEMORY_IMG_HASH_DIM")
+        dim = int(env_dim) if env_dim else int(MEMCFG.HASH_FALLBACK_DIM or 256)
+    except Exception:
+        dim = int(MEMCFG.HASH_FALLBACK_DIM or 256)
+    return max(256, min(dim, 4096))
+
+def reset_image_backend_cache() -> None:
+    """
+    Testing/helper hook: clears the lazily-initialized image backend so the next call
+    re-reads environment variables and re-initializes models.
+    """
+    global _image_model, _image_processor, _image_dim, _image_hint
+    _image_model = None
+    _image_processor = None
+    _image_dim = None
+    _image_hint = None
+
 def _lazy_init_image() -> None:
     """
-    Try to initialize a local image encoder. We attempt, in order:
-      1) transformers CLIP (openai/clip-vit-base-patch32)
-      2) open_clip (ViT-B-32 laion2b)
-    If neither is available locally, we fall back to a deterministic hash vector.
+    Try to initialize a local image encoder unless a forced backend says otherwise.
+    Order:
+      - forced hash (skip heavy imports)
+      - transformers CLIP
+      - open_clip
+      - fallback hash
     """
     global _image_model, _image_processor, _image_dim, _image_hint
     if _image_model is not None or _image_hint is not None:
         return
 
-    # Try HuggingFace transformers CLIP (requires local cache or installed weights)
+    # Respect forced hash before trying heavy imports
+    forced = _forced_img_backend()
+    if forced == "hash":
+        _image_model = None
+        _image_processor = None
+        _image_dim = _hash_img_dim()
+        _image_hint = f"hash-img-{_image_dim}"
+        return
+
+    # Try HuggingFace transformers CLIP
     try:
         from transformers import CLIPModel, CLIPProcessor  # type: ignore
         import torch  # type: ignore
         model_id = "openai/clip-vit-base-patch32"
         _image_model = CLIPModel.from_pretrained(model_id)
         _image_processor = CLIPProcessor.from_pretrained(model_id)
-        # CLIP image embed dim is usually 512
         _image_dim = int(_image_model.visual_projection.out_features)  # type: ignore[attr-defined]
         _image_hint = model_id
         return
@@ -171,7 +230,7 @@ def _lazy_init_image() -> None:
         _image_processor = None
 
     # Fallback (hash-based)
-    _image_dim = max(256, int(MEMCFG.HASH_FALLBACK_DIM or 256))
+    _image_dim = _hash_img_dim()
     _image_hint = f"hash-img-{_image_dim}"
 
 
@@ -181,18 +240,17 @@ def get_image_embedding(
 ) -> np.ndarray:
     """
     Returns a single 1D float32 numpy vector for the image. Accepts bytes, path, or PIL.Image.Image.
-    If no local image model is available, returns a deterministic hash-based embedding.
+    If no local image model is available OR hash is forced, returns a deterministic hash-based embedding.
     """
     _lazy_init_image()
 
-    # Fast path: hash fallback (no heavy deps)
-    if _image_model is None or _image_processor is None:
+    # Even after init, respect per-call forced override
+    if _forced_img_backend() == "hash" or _image_model is None or _image_processor is None:
         img_bytes = _ensure_bytes_image(image)
         return _hash_vec(img_bytes, int(_image_dim))
 
     # CLIP / open_clip path
     try:
-        # Normalize input to a PIL image
         from PIL import Image  # type: ignore
         if isinstance(image, (bytes, bytearray, memoryview)):
             image = Image.open(io.BytesIO(bytes(image))).convert("RGB")
@@ -218,7 +276,6 @@ def get_image_embedding(
             v = v[0].detach().cpu().numpy().astype(np.float32)
             return _normalize(v) if normalize else v
         except Exception:
-            # If runtime fails, fall back
             img_bytes = _ensure_bytes_image(image)
             return _hash_vec(img_bytes, int(_image_dim))
     except Exception:
@@ -227,6 +284,11 @@ def get_image_embedding(
 
 
 def image_model_hint() -> str:
+    # Reflect forced override at call time
+    forced = _forced_img_backend()
+    if forced == "hash":
+        return f"hash-img-{_hash_img_dim()}"
+    # If explicitly forcing HF, we still go through normal init (CLIP/open_clip first)
     _lazy_init_image()
     return str(_image_hint)
 

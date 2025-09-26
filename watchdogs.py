@@ -1,7 +1,7 @@
 # watchdogs.py
 import threading
 import time
-from typing import Tuple, Callable, Dict, List, Optional
+from typing import Tuple, Callable, Dict, List, Optional, Any  # added Any
 
 from reaper.reaper import Reaper, kill_current_process
 from reaper.heartbeatdetector import HeartbeatDetector
@@ -10,7 +10,8 @@ from reaper.liveness_cycle import LivenessByCycles, DEFAULT_MAX_MISSED_CYCLES
 from reaper.lifespan import LifespanByCycles
 from reaper.no_goals import NoGoalsGuard
 from reaper.memory import MemoryHealthGuard
-from reaper.repeat import RepeatLoopGuard  # ← NEW
+from reaper.repeat import RepeatLoopGuard 
+from observability.nervous_system import HealthBus, NervousSystem
 
 # Provider type hints (optional, just for clarity)
 GetGoals = Callable[[], List[Dict]]
@@ -105,6 +106,10 @@ def start_watchdogs(
     retry_k: int = 5,
     retry_w: float = 30.0,
     retry_escalate_k: int = 8,
+    # --------- NERVOUS SYSTEM ( minimal additions) ---------
+    memory_daemon: Optional[Any] = None,
+    ns_sample_interval_s: float = 0.2,   # 5 Hz sensing
+    ns_summary_interval_s: float = 5.0,  # compact memory summaries
 ):
     """
     Spin up a daemon thread that continuously checks watchdogs.
@@ -210,6 +215,59 @@ def start_watchdogs(
 
     t = threading.Thread(target=watchdog_thread, name="watchdogs", daemon=True)
     t.start()
+
+    # ------------- Nervous System wiring (5 Hz sampler; optional memory summaries) -------------
+    # Build a closure that reads current raw values from the live objects above.
+    def _get_reaper_raw() -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        try:
+            out["pulse_cycles"] = float(pulse.read())
+        except Exception:
+            pass
+
+        try:
+            ap = getattr(detector, "avg_period_ms", None)
+            out["hb_avg_period_ms"] = float(ap() if callable(ap) else (ap or 0.0))
+        except Exception:
+            pass
+
+        try:
+            out["errors_any_rate"] = float(getattr(errors, "any_rate", 0.0) or 0.0)
+        except Exception:
+            pass
+
+        for name in ["rss_mb", "cpu_util", "index_lag", "working_cache"]:
+            try:
+                v = getattr(mem_guard, name, None)
+                v = v() if callable(v) else v
+                if v is not None:
+                    out[name] = float(v)
+            except Exception:
+                pass
+
+        return out
+
+    health_bus = HealthBus(maxlen=1200, alpha=0.25)
+    # Try to discover a sensible working_cache cap if mem_guard exposes one; else default 512.
+    wc_cap = getattr(mem_guard, "working_cap", 512)
+
+    nervous = NervousSystem(
+        get_raw=_get_reaper_raw,
+        bus=health_bus,
+        daemon=memory_daemon,                 # writes compact summaries to memory if provided
+        sample_interval_s=ns_sample_interval_s,   # << every 0.2s by default
+        summary_interval_s=ns_summary_interval_s, # memory write cadence
+        ranges={
+            "cpu_util": (0.05, 0.85),
+            "rss_mb": (300, 1500),
+            "hb_ms": (5, 50),
+            "err_rps": (0.0, 0.5),
+            "index_lag": (0.0, 200.0),
+            "working_cache": (0.0, float(wc_cap)),
+        },
+    )
+    nervous.start()
+    # ------------------------------------------------------------------------------------------
 
     return (
         reaper,

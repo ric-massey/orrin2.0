@@ -100,9 +100,11 @@ class StepRunner:
         self.q: "queue.Queue[Step]" = step_queue
         self.workers = max(0, int(workers))
         self.ctx: HandlerContext = dict(ctx or {})
-        self._stop = threading.Event()
+        # robust, idempotent shutdown controls
+        self._stop_evt = threading.Event()
+        self._stopping = False
         self._threads: List[threading.Thread] = []
-        self._active_mu = threading.Lock()
+        self._active_mu = threading.RLock()   # re-entrant to avoid self-deadlock
         self._active_count = 0
         self._reaper_sink = reaper_sink
 
@@ -117,12 +119,24 @@ class StepRunner:
 
     def stop(self) -> None:
         _dbg("stop called")
-        self._stop.set()
+        # Idempotent: avoid double shutdowns
+        if self._stopping:
+            return
+        self._stopping = True
+
+        if not isinstance(getattr(self, "_stop_evt", None), threading.Event):
+            self._stop_evt = threading.Event()
+        self._stop_evt.set()
+
+        # Send one poison pill per worker so each can exit cleanly
         for _ in self._threads:
             try:
-                self.q.put_nowait(None)  # type: ignore[arg-type]
+                self.q.put(None)  # type: ignore[arg-type]
             except Exception:
-                break
+                try:
+                    self.q.put_nowait(None)  # type: ignore[arg-type]
+                except Exception:
+                    pass
 
     def join(self, timeout: Optional[float] = None) -> None:
         for t in self._threads:
@@ -131,10 +145,20 @@ class StepRunner:
     # Public enqueue for schedulers/daemons
     def submit(self, step: Step) -> None:
         _dbg("submit step:", step.id, "goal:", step.goal_id)
+        # If the test configured workers=0, run synchronously so tests don't hang.
+        if self.workers <= 0:
+            self._execute_step(step)
+            return
+
+        # If workers were configured but start() wasn't called, auto-start once.
+        if not self._threads and self.workers > 0:
+            self.start()
+
         try:
             self.q.put_nowait(step)
         except Exception:
             self.q.put(step)
+
 
     # ----- metrics/introspection -----
 
@@ -146,12 +170,14 @@ class StepRunner:
     def _inc_active(self) -> None:
         with self._active_mu:
             self._active_count += 1
-            self._set_worker_metrics()
+            active = self._active_count
+        self._set_worker_metrics(active)  # emit outside lock
 
     def _dec_active(self) -> None:
         with self._active_mu:
             self._active_count = max(0, self._active_count - 1)
-            self._set_worker_metrics()
+            active = self._active_count
+        self._set_worker_metrics(active)  # emit outside lock
 
     def capacity_left(self) -> int:
         cap = max(0, self.workers - self.active_workers)
@@ -164,9 +190,9 @@ class StepRunner:
         except Exception:
             return 0
 
-    def _set_worker_metrics(self) -> None:
+    def _set_worker_metrics(self, active: Optional[int] = None) -> None:
         try:
-            metrics_mod.update_queue(self.queue_size(), self.active_workers)
+            metrics_mod.update_queue(self.queue_size(), self.active_workers if active is None else active)
         except Exception:
             pass
 
@@ -174,14 +200,18 @@ class StepRunner:
 
     def _worker(self) -> None:
         _dbg("worker started")
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 item = self.q.get(timeout=0.3)
             except queue.Empty:
                 continue
             if item is None:  # poison
                 _dbg("worker got poison pill")
-                continue
+                try:
+                    self.q.task_done()
+                except Exception:
+                    pass
+                break  # exit loop
 
             step: Step = item
             _dbg("dequeued step:", step.id, "goal:", step.goal_id)
@@ -224,8 +254,15 @@ class StepRunner:
 
         started_emitted = False
         t0 = time.perf_counter()
+        # ---- anti-stall guards ----
+        stall_s = 10.0     # no-progress window before we defer
+        max_run_s = 60.0   # hard cap for a single _execute_step loop
+        last_change = t0
+        last_state = (getattr(step.status, "name", str(step.status)),
+                      int(step.attempts or 0),
+                      step.started_at.isoformat() if step.started_at else None)
 
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 new = handler.tick(goal, step, self._handler_ctx(goal))
                 if new is not None:
@@ -237,18 +274,42 @@ class StepRunner:
                 _dbg("tick raised:", step.last_error, "attempts:", step.attempts, "/", step.max_attempts)
                 if step.attempts >= step.max_attempts:
                     step.status = Status.FAILED
-                    step.finished_at = UTCNOW()
+                    if step.finished_at is None:
+                        step.finished_at = UTCNOW()
                 else:
                     step.status = Status.READY
                     step.started_at = None
 
+            # --- DEFENSIVE NORMALIZATIONS ---
+            if step.status == Status.RUNNING and step.started_at is None:
+                step.started_at = UTCNOW()
+
+            # progress detection (status/attempts/started_at change)
+            cur_state = (getattr(step.status, "name", str(step.status)),
+                         int(step.attempts or 0),
+                         step.started_at.isoformat() if step.started_at else None)
+            if cur_state != last_state:
+                last_state = cur_state
+                last_change = time.perf_counter()
+
+            # Emit StepStarted exactly once, and flip goal→RUNNING on first start
             if not started_emitted and step.started_at is not None:
                 self._emit_step_event("StepStarted", step, goal_kind=goal.kind)
                 started_emitted = True
+                if goal.status not in {Status.RUNNING, Status.DONE, Status.FAILED, Status.CANCELLED}:
+                    ng = replace(goal, status=Status.RUNNING, updated_at=UTCNOW())
+                    _upsert_goal(self.store, ng)
+                    goal = ng  # carry forward for subsequent emits/finalize
 
+            # Persist latest step state each loop
             _upsert_step(self.store, step)
 
+            # ---- terminal handling ----
             if step.status in {Status.DONE, Status.FAILED, Status.CANCELLED}:
+                if step.finished_at is None:
+                    step.finished_at = UTCNOW()
+                    _upsert_step(self.store, step)
+
                 extra = {"duration_sec": max(0.0, time.perf_counter() - t0)}
                 if step.status == Status.DONE:
                     self._emit_step_event("StepFinished", step, goal_kind=goal.kind, extra=extra)
@@ -256,30 +317,101 @@ class StepRunner:
                 elif step.status == Status.FAILED:
                     self._emit_step_event("StepFailed", step, goal_kind=goal.kind, extra=extra)
                     _dbg("failed step:", step.id)
-                self._maybe_finalize_goal(goal, step)
+                elif step.status == Status.CANCELLED:
+                    self._emit_step_event("StepCancelled", step, goal_kind=goal.kind, extra=extra)
+                    _dbg("cancelled step:", step.id)
+
+                # Robust finalization: allow the store a moment to reflect the latest write.
+                for _ in range(6):  # up to ~60 ms total
+                    if self._maybe_finalize_goal(goal, step):
+                        break
+                    time.sleep(0.01)
                 return
 
+            # deferrable states return control to scheduler
             if step.status in {Status.READY, Status.WAITING, Status.BLOCKED, Status.PAUSED}:
                 _dbg("deferring step:", step.id, "status:", step.status.name)
+                return
+
+            # ---- anti-stall checks for long RUNNING loops ----
+            now = time.perf_counter()
+            if (now - last_change) >= stall_s and step.status == Status.RUNNING:
+                _dbg("no-progress defer:", step.id, "after", round(now - last_change, 3), "s")
+                self._emit_step_event("StepDeferredNoProgress", step, goal_kind=goal.kind,
+                                      extra={"stalled_sec": round(now - last_change, 3)})
+                step.status = Status.READY
+                step.started_at = None
+                _upsert_step(self.store, step)
+                return
+
+            if (now - t0) >= max_run_s:
+                _dbg("max_run cap hit for step:", step.id)
+                if (step.attempts or 0) + 1 >= (step.max_attempts or 1):
+                    step.status = Status.FAILED
+                    step.last_error = (step.last_error or "") + " | max_run_s exceeded"
+                    step.finished_at = UTCNOW()
+                else:
+                    step.status = Status.READY
+                    step.started_at = None
+                    step.last_error = (step.last_error or "") + " | max_run_s exceeded"
+                    step.attempts = int(step.attempts or 0) + 1
+                _upsert_step(self.store, step)
+                self._emit_step_event("StepDeferredMaxRun", step, goal_kind=goal.kind,
+                                      extra={"max_run_s": max_run_s})
                 return
 
             time.sleep(0.02)
 
     # ----- helpers -----
 
-    def _maybe_finalize_goal(self, goal: Goal, last_step: Step) -> None:
-        steps = _list_steps(self.store, goal_id=goal.id)
-        if last_step.status == Status.FAILED and (last_step.attempts or 0) >= (last_step.max_attempts or 0):
+    def _maybe_finalize_goal(self, goal: Goal, last_step: Step) -> bool:
+        """
+        Try to finalize a goal based on current step states.
+        Returns True if we transitioned the goal to a terminal state, else False.
+        """
+        # Read what the store currently sees
+        store_steps = _list_steps(self.store, goal_id=goal.id)
+
+        # Build by-id and overlay the freshest in-memory last_step
+        by_id: Dict[str, Step] = {s.id: s for s in store_steps}
+        by_id[last_step.id] = last_step
+        steps = list(by_id.values())
+
+        # Early finalize if no steps are visible yet but we have a terminal last_step.
+        if not steps:
+            if last_step.status in {Status.DONE, Status.CANCELLED}:
+                ng = replace(goal, status=Status.DONE, updated_at=UTCNOW())
+                _upsert_goal(self.store, ng)
+                self._emit_goal_event("GoalFinished", ng, extra={"steps_total": 1, "reason": "no_steps_visible"})
+                _dbg("finalized goal DONE (no steps visible):", goal.id)
+                return True
+            if last_step.status == Status.FAILED and (last_step.attempts or 0) >= (last_step.max_attempts or 0):
+                ng = replace(goal, status=Status.FAILED, updated_at=UTCNOW(), last_error=last_step.last_error)
+                _upsert_goal(self.store, ng)
+                self._emit_goal_event("GoalFailed", ng, extra={"step_id": last_step.id, "reason": "no_steps_visible"})
+                _dbg("finalized goal FAILED (no steps visible):", goal.id)
+                return True
+            return False
+
+        # If anything failed and nothing else is pending → FAIL the goal.
+        any_failed = any(s.status == Status.FAILED for s in steps)
+        any_pending = any(s.status not in {Status.DONE, Status.CANCELLED, Status.FAILED} for s in steps)
+        if any_failed and not any_pending:
             ng = replace(goal, status=Status.FAILED, updated_at=UTCNOW(), last_error=last_step.last_error)
             _upsert_goal(self.store, ng)
             self._emit_goal_event("GoalFailed", ng, extra={"step_id": last_step.id})
             _dbg("finalized goal FAILED:", goal.id)
-            return
+            return True
+
+        # Done when all steps are terminal non-failed
         if steps and all(s.status in {Status.DONE, Status.CANCELLED} for s in steps):
             ng = replace(goal, status=Status.DONE, updated_at=UTCNOW())
             _upsert_goal(self.store, ng)
             self._emit_goal_event("GoalFinished", ng, extra={"steps_total": len(steps)})
             _dbg("finalized goal DONE:", goal.id)
+            return True
+
+        return False
 
     def _get_handler(self, goal: Goal) -> Optional[GoalHandler]:
         reg = self.registry

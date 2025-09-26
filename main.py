@@ -26,9 +26,49 @@ METRICS_PORT = 9100  # http://127.0.0.1:9100/metrics
 serve_metrics(port=METRICS_PORT)
 print(f"[metrics] Prometheus exporter on http://127.0.0.1:{METRICS_PORT}/metrics")
 
-# ---------- Dist paths (update if your repo lives elsewhere) ----------
-METRICS_DIST_DIR = Path("/Users/ricmassey/orrin/orrin2.0/UI/metrics-dashboard/dist").resolve()
-MEMORY_DIST_DIR  = Path("/Users/ricmassey/orrin/orrin2.0/UI/memory-dashboard/dist").resolve()
+# ---------- Dist paths (PORTABLE: no user-specific hard-coding) ----------
+def _repo_root_from_file(this_file: str) -> Path:
+    # If main.py lives in the repo root, .parent is correct.
+    # If you later move main.py into a subdir, adjust to .parent.parent, etc.
+    return Path(this_file).resolve().parent
+
+REPO_ROOT = Path(os.environ.get("ORRIN_REPO_ROOT", _repo_root_from_file(__file__)))
+
+# Allow environment overrides (useful for packaging/CI), otherwise resolve from repo structure
+METRICS_DIST_DIR = Path(
+    os.environ.get(
+        "ORRIN_METRICS_DIST",
+        REPO_ROOT / "UI" / "metrics-dashboard" / "dist",
+    )
+).resolve()
+
+MEMORY_DIST_DIR = Path(
+    os.environ.get(
+        "ORRIN_MEMORY_DIST",
+        REPO_ROOT / "UI" / "memory-dashboard" / "dist",
+    )
+).resolve()
+
+def _require_dist(dist_dir: Path, ui_name: str) -> None:
+    """Verify dist_dir/index.html exists, otherwise print a build hint relative to REPO_ROOT."""
+    idx = dist_dir / "index.html"
+    print(f"[{ui_name}] using dist_dir: {dist_dir}")
+    print(f"[{ui_name}] dist_dir exists: {dist_dir.exists()}  index.html exists: {idx.exists()}")
+    if not dist_dir.exists() or not idx.exists():
+        # Build hint: if dist_dir is inside REPO_ROOT, show a clean relative path
+        try:
+            ui_rel = dist_dir.relative_to(REPO_ROOT)
+            build_cd = REPO_ROOT / ui_rel.parent
+        except ValueError:
+            # dist_dir is outside REPO_ROOT or unrelated; just use its parent
+            build_cd = dist_dir.parent
+        raise SystemExit(
+            f"[{ui_name}] UI build not found.\n"
+            "Build it, then run again:\n"
+            f"  cd {build_cd}\n"
+            "  npm install\n"
+            "  npm run build\n"
+        )
 
 # ---------- Ports ----------
 DASH_PORT     = int(os.environ.get("ORRIN_DASH_PORT", "9310"))    # metrics UI
@@ -70,18 +110,7 @@ def start_memory_server(dist_dir: str, port: int, memory_health_provider):
 # ---------- Start Metrics Dashboard ----------
 dash_thread = dash_httpd = None
 try:
-    idx = METRICS_DIST_DIR / "index.html"
-    print(f"[dashboard] using dist_dir: {METRICS_DIST_DIR}")
-    print(f"[dashboard] dist_dir exists: {METRICS_DIST_DIR.exists()}  index.html exists: {idx.exists()}")
-    if not METRICS_DIST_DIR.exists() or not idx.exists():
-        raise SystemExit(
-            "[dashboard] Metrics UI build not found.\n"
-            "Build it, then run again:\n"
-            "  cd /Users/ricmassey/orrin/orrin2.0/UI/metrics-dashboard\n"
-            "  npm install\n"
-            "  npm run build\n"
-        )
-
+    _require_dist(METRICS_DIST_DIR, "dashboard")
     dash_thread, dash_httpd, dash_url = start_dashboard_server(
         dist_dir=str(METRICS_DIST_DIR),
         port=DASH_PORT,
@@ -195,57 +224,51 @@ def get_memory_health():
 # ---------- Start Memory Dashboard (with fallback if server lacks memory_health_provider) ----------
 mem_dash_thread = mem_dash_httpd = None
 try:
-    idx2 = MEMORY_DIST_DIR / "index.html"
-    print(f"[memory-dashboard] using dist_dir: {MEMORY_DIST_DIR}")
-    print(f"[memory-dashboard] dist_dir exists: {MEMORY_DIST_DIR.exists()}  index.html exists: {idx2.exists()}")
-    if not MEMORY_DIST_DIR.exists() or not idx2.exists():
-        print(
-            "[memory-dashboard] Memory UI build not found.\n"
-            "Build it, then run again:\n"
-            "  cd /Users/ricmassey/orrin/orrin2.0/UI/memory-dashboard\n"
-            "  npm install\n"
-            "  npm run build\n"
+    _require_dist(MEMORY_DIST_DIR, "memory-dashboard")
+    try:
+        # Preferred: server supports /memory via memory_health_provider
+        mem_dash_thread, mem_dash_httpd, mem_dash_url = start_dashboard_server(
+            dist_dir=str(MEMORY_DIST_DIR),
+            port=MEM_DASH_PORT,
+            metrics_upstream=f"http://127.0.0.1:{METRICS_PORT}/metrics",
+            memory_health_provider=get_memory_health,  # serve /memory here
+            open_browser=True,
         )
-    else:
-        try:
-            # Preferred: server supports /memory via memory_health_provider
-            mem_dash_thread, mem_dash_httpd, mem_dash_url = start_dashboard_server(
-                dist_dir=str(MEMORY_DIST_DIR),
-                port=MEM_DASH_PORT,
-                metrics_upstream=f"http://127.0.0.1:{METRICS_PORT}/metrics",
-                memory_health_provider=get_memory_health,  # serve /memory here
-                open_browser=True,
-            )
-            print("[memory-dashboard] /memory endpoint wired via memory_health_provider")
-        except TypeError:
-            # Fallback: our small server that always exposes /memory
-            print("[memory-dashboard] start_dashboard_server lacks memory_health_provider → using fallback server")
-            mem_dash_thread, mem_dash_httpd, mem_dash_url = start_memory_server(
-                dist_dir=str(MEMORY_DIST_DIR),
-                port=MEM_DASH_PORT,
-                memory_health_provider=get_memory_health,
-            )
-            webbrowser.open(mem_dash_url)
-        print(f"[memory-dashboard] serving at {mem_dash_url}")
+        print("[memory-dashboard] /memory endpoint wired via memory_health_provider")
+    except TypeError:
+        # Fallback: our small server that always exposes /memory
+        print("[memory-dashboard] start_dashboard_server lacks memory_health_provider → using fallback server")
+        mem_dash_thread, mem_dash_httpd, mem_dash_url = start_memory_server(
+            dist_dir=str(MEMORY_DIST_DIR),
+            port=MEM_DASH_PORT,
+            memory_health_provider=get_memory_health,
+        )
+        webbrowser.open(mem_dash_url)
+    print(f"[memory-dashboard] serving at {mem_dash_url}")
 except Exception as e:
     print(f"[memory-dashboard] not started: {e}")
 
 # ---------- Watchdogs ----------
 pulse = Pulse()
 
-# Call start_watchdogs with a fallback if it doesn't accept get_memory_health
+# Call start_watchdogs with a fallback if it doesn't accept the newer args
 try:
     tup = start_watchdogs(
         pulse,
         per_key_limits={"llm_timeout": (10, 15.0)},
-        get_memory_health=get_memory_health,  # newer versions
+        get_memory_health=get_memory_health,   # newer versions
+        # ↓ enable 5 Hz nervous-system sampling + compact summaries into memory
+        memory_daemon=daemon,
+        ns_sample_interval_s=0.2,              # sample every 0.2s
+        ns_summary_interval_s=5.0,             # write summary events every 5s
     )
 except TypeError:
-    # Older signature: call without get_memory_health
+    # Older signature: call without the new args (sampler won’t run in that build)
     tup = start_watchdogs(
         pulse,
         per_key_limits={"llm_timeout": (10, 15.0)},
     )
+
 
 (
     reaper,        # kill switch (reaper.trigger("reason"))

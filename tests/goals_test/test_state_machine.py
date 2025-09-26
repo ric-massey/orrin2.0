@@ -1,4 +1,4 @@
-# tests/goals/test_state_machine.py
+# tests/goals_test/test_state_machine.py
 # End-to-end state-machine style tests for goals/steps across NEW→READY→RUNNING→{DONE,FAILED},
 # plus BLOCKED↔READY and PAUSED gating.
 
@@ -14,7 +14,7 @@ import pytest
 
 # --- FIX: support both module names (daemon.py shim or goals_daemon.py) ---
 try:
-    from goals.daemon import GoalsDaemon  # preferred (shim re-exports if you renamed)
+    from goals.goals_daemon import GoalsDaemon  # preferred (shim re-exports if you renamed)
 except Exception:  # pragma: no cover
     from goals.goals_daemon import GoalsDaemon
 
@@ -23,9 +23,7 @@ from goals.store import FileGoalsStore
 from goals.model import Goal, Step, Status, Priority
 from goals.handlers.base import BaseGoalHandler, HandlerContext
 
-
 UTCNOW = lambda: datetime.now(timezone.utc)
-
 
 # -----------------------------
 # Test helpers
@@ -38,7 +36,6 @@ def wait_until(pred, *, timeout=3.0, interval=0.02) -> bool:
             return True
         time.sleep(interval)
     return False
-
 
 # -----------------------------
 # Dummy handlers for state-machine exercises
@@ -56,10 +53,10 @@ class SuccHandler(BaseGoalHandler):
 
     def tick(self, goal: Goal, step: Step, ctx: HandlerContext) -> Optional[Step]:
         if step.started_at is None:
-            step.started_at = self._utcnow()
+            step.started_at = UTCNOW()
             step.status = Status.RUNNING
         step.status = Status.DONE
-        step.finished_at = self._utcnow()
+        step.finished_at = UTCNOW()
         return step
 
 
@@ -76,10 +73,10 @@ class BlockThenUnblockHandler(BaseGoalHandler):
 
     def tick(self, goal: Goal, step: Step, ctx: HandlerContext) -> Optional[Step]:
         if step.started_at is None:
-            step.started_at = self._utcnow()
+            step.started_at = UTCNOW()
             step.status = Status.RUNNING
         step.status = Status.DONE
-        step.finished_at = self._utcnow()
+        step.finished_at = UTCNOW()
         return step
 
 
@@ -95,13 +92,13 @@ class FlakyOnceHandler(BaseGoalHandler):
 
     def tick(self, goal: Goal, step: Step, ctx: HandlerContext) -> Optional[Step]:
         if step.started_at is None:
-            step.started_at = self._utcnow()
+            step.started_at = UTCNOW()
             step.status = Status.RUNNING
         # Fail on first attempt, succeed afterwards
         if (step.attempts or 0) == 0:
             raise RuntimeError("transient")
         step.status = Status.DONE
-        step.finished_at = self._utcnow()
+        step.finished_at = UTCNOW()
         return step
 
 
@@ -118,12 +115,11 @@ class PauseHandler(BaseGoalHandler):
 
     def tick(self, goal: Goal, step: Step, ctx: HandlerContext) -> Optional[Step]:
         if step.started_at is None:
-            step.started_at = self._utcnow()
+            step.started_at = UTCNOW()
             step.status = Status.RUNNING
         step.status = Status.DONE
-        step.finished_at = self._utcnow()
+        step.finished_at = UTCNOW()
         return step
-
 
 # -----------------------------
 # Fixtures
@@ -132,7 +128,6 @@ class PauseHandler(BaseGoalHandler):
 @pytest.fixture()
 def store(tmp_path: Path) -> FileGoalsStore:
     return FileGoalsStore(data_dir=tmp_path / "goals-data")
-
 
 @pytest.fixture()
 def registry() -> GoalRegistry:
@@ -143,7 +138,6 @@ def registry() -> GoalRegistry:
     reg.register(PauseHandler(), replace=True)
     return reg
 
-
 @pytest.fixture()
 def daemon(store: FileGoalsStore, registry: GoalRegistry):
     d = GoalsDaemon(store=store, registry=registry, workers=2, tick_seconds=0.05, ctx={})
@@ -151,7 +145,6 @@ def daemon(store: FileGoalsStore, registry: GoalRegistry):
     yield d
     d.stop()
     d.join(timeout=2.0)
-
 
 # -----------------------------
 # Tests
@@ -167,7 +160,6 @@ def test_new_ready_running_done_path(store: FileGoalsStore, daemon: GoalsDaemon)
     assert steps and steps[0].status == Status.DONE
     assert steps[0].started_at is not None and steps[0].finished_at is not None
 
-
 def test_blocked_then_unblocked_then_done(store: FileGoalsStore, daemon: GoalsDaemon):
     g = Goal(id="g_block", title="block cycle", kind="blocky", spec={}, status=Status.NEW)
     store.upsert_goal(g)
@@ -179,7 +171,6 @@ def test_blocked_then_unblocked_then_done(store: FileGoalsStore, daemon: GoalsDa
     # Then it should unblock and complete
     assert wait_until(lambda: (store.get_goal("g_block") or g).status == Status.DONE, timeout=2.0)
 
-
 def test_retry_after_handler_error_then_done(store: FileGoalsStore, daemon: GoalsDaemon):
     g = Goal(id="g_retry", title="flaky once", kind="flaky", spec={}, status=Status.NEW, priority=Priority.HIGH)
     store.upsert_goal(g)
@@ -189,7 +180,6 @@ def test_retry_after_handler_error_then_done(store: FileGoalsStore, daemon: Goal
 
     s = store.steps_for("g_retry")[0]
     assert s.status == Status.DONE and (s.attempts or 0) >= 1
-
 
 def test_paused_goal_with_ready_step_is_ignored_until_resumed(store: FileGoalsStore, daemon: GoalsDaemon):
     # Create a PAUSED goal (so daemon ignores it), but inject a READY step manually.

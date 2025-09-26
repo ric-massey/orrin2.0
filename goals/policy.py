@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .model import Goal, Step, Status, Priority
 
@@ -45,6 +45,8 @@ def choose_next_steps(
     3) Deadlines: overdue gets a large bump; near deadlines get a smaller bump.
     4) Fairness: goals not picked recently accrue "wait" credit (soft bump).
     5) Optional locks hint: if step.action has "locks": ["name", ...], prefer steps whose locks are available.
+    6) Second pass: if capacity remains, allow additional steps from the SAME goal
+       only when that goal is effectively CRITICAL because its deadline is overdue.
 
     Returns
     -------
@@ -64,7 +66,6 @@ def choose_next_steps(
 
     # Compute scores for each (goal, step)
     scored: List[Tuple[Tuple, Goal, Step]] = []
-    seen_goal_ids: set[str] = set()
 
     for g, s in candidates:
         if s.status != Status.READY:
@@ -109,25 +110,32 @@ def choose_next_steps(
     # Pick at most one step per goal per pulse
     chosen: List[Step] = []
     used_goals: set[str] = set()
+    chosen_ids: set[str] = set()
 
     for _key, g, s in scored:
         if len(chosen) >= cap:
             break
         if g.id in used_goals:
             continue
+        if s.id in chosen_ids:
+            continue
         chosen.append(s)
         used_goals.add(g.id)
+        chosen_ids.add(s.id)
 
-    # If we still have capacity, allow a second pass to add more steps from distinct high-priority overdue goals.
+    # Second pass: allow extra steps from goals that are overdue → effectively CRITICAL,
+    # only if capacity remains, and never duplicate already-chosen steps.
     if len(chosen) < cap:
-        extra_needed = cap - len(chosen)
         for _key, g, s in scored:
             if len(chosen) >= cap:
                 break
-            if g.id in used_goals:
-                # Allow a second step only if CRITICAL and overdue; prevents starvation on urgent epics.
-                if _effective_priority(g, now) >= Priority.CRITICAL and g.overdue(now):
-                    chosen.append(s)
+            if g.id not in used_goals:
+                continue  # only top-up goals that already got one step
+            if _effective_priority(g, now) >= Priority.CRITICAL and g.overdue(now):
+                if s.id in chosen_ids:
+                    continue
+                chosen.append(s)
+                chosen_ids.add(s.id)
 
     # Update fairness timestamps for goals we picked
     ts_now = _now_ts()

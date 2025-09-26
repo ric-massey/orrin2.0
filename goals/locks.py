@@ -7,12 +7,10 @@ import time
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Any
-
+from typing import Dict, Optional, List, Any, Tuple
 
 def _now() -> float:
     return time.monotonic()
-
 
 @dataclass
 class _LockState:
@@ -20,40 +18,22 @@ class _LockState:
     acquired_at: float
     renew_at: float  # timestamp when we consider it stale/expired (if ttl_seconds is set)
 
+# Grace windows
+STALE_WAITER_S = 5.0    # evict a dead/stalled head waiter after this many seconds
+STALE_HOLDER_S = 15.0   # if TTL=None and holder lives longer than this, head waiter may steal
 
 class LockManager:
     """
     Minimal, thread-safe lock manager for *named* exclusive resources.
     Intended for single-process use (daemon + handlers). For multi-process, wrap with file/db-based locks.
-
-    Semantics:
-      - acquire(name, holder_id) -> bool
-          True if lock was obtained or is already held by the same holder (reentrant).
-          If a TTL is configured and the existing lock is expired, we steal it.
-
-      - release(name, holder_id) -> None
-          Idempotent: only the current holder (or an expired one) will clear the lock.
-
-      - renew(name, holder_id) -> bool
-          Extend TTL if you still hold the lock. Returns False if not the holder.
-
-      - acquire_blocking(name, holder_id, timeout=None, poll_interval=0.05) -> bool
-          Spin-waits until the lock is acquired or timeout elapses.
-
-      - session(name, holder_id):
-          Context manager that acquires then releases, renewing automatically between long steps is up to caller.
-
-    Notes:
-      - Fairness: best-effort via FIFO waiters list; non-blocking acquire() does not reorder, but blocking acquire
-        will append to waiters and check turn order. TTL helps avoid dead holders.
-      - TTL: if ttl_seconds is None, locks don't expire automatically.
     """
 
     def __init__(self, *, ttl_seconds: Optional[float] = 60.0) -> None:
         self.ttl_seconds = ttl_seconds
         self._mu = threading.Lock()
         self._locks: Dict[str, _LockState] = {}
-        self._waiters: Dict[str, List[str]] = {}  # lock name -> list of holder_ids (FIFO expectation)
+        self._waiters: Dict[str, List[str]] = {}               # lock name -> FIFO holder_ids
+        self._waiter_enq_ts: Dict[Tuple[str, str], float] = {} # (name, holder_id) -> enqueue time
 
     # -------- core ops --------
 
@@ -65,7 +45,7 @@ class LockManager:
             # Lock is free
             if st is None:
                 self._locks[name] = _LockState(holder=holder_id, acquired_at=now, renew_at=self._new_renew_at(now))
-                self._pop_waiter_if_head(name, holder_id)  # claim our spot if present
+                self._pop_waiter_if_head_locked(name, holder_id)  # NOTE: locked variant
                 return True
 
             # Reentrant by same holder
@@ -76,7 +56,7 @@ class LockManager:
             # Expired lock can be stolen
             if self._expired(st, now):
                 self._locks[name] = _LockState(holder=holder_id, acquired_at=now, renew_at=self._new_renew_at(now))
-                self._pop_waiter_if_head(name, holder_id)
+                self._pop_waiter_if_head_locked(name, holder_id)  # NOTE: locked variant
                 return True
 
             # Respect FIFO if we are not at the head (for blocking callers)
@@ -91,7 +71,7 @@ class LockManager:
                 return
             if st.holder == holder_id or self._expired(st, now):
                 self._locks.pop(name, None)
-                self._pop_waiter_if_head(name, holder_id)
+                self._pop_waiter_if_head_locked(name, holder_id)  # NOTE: locked variant
 
     def renew(self, name: str, holder_id: str) -> bool:
         now = _now()
@@ -116,15 +96,20 @@ class LockManager:
         self._enqueue_waiter(name, holder_id)
         try:
             while True:
-                # If there's a waiter queue and we're not at head, wait our turn
+                # If there's a waiter queue and we're not at head, wait our turn (and evict a stale head if needed)
                 if not self._is_head_waiter(name, holder_id):
+                    self._evict_stale_head_if_needed(name)  # prevent permanent stalls when the head died
                     if deadline is not None and _now() >= deadline:
                         return False
                     time.sleep(poll_interval)
                     continue
 
+                # We are head: try to acquire
                 if self.acquire(name, holder_id):
                     return True
+
+                # Dead-holder rescue for TTL=None: if holder is stuck too long, steal it
+                self._steal_if_dead_holder(name, holder_id, max_age_s=STALE_HOLDER_S)
 
                 if deadline is not None and _now() >= deadline:
                     return False
@@ -211,16 +196,20 @@ class LockManager:
             q = self._waiters.setdefault(name, [])
             if holder_id not in q:
                 q.append(holder_id)
+                self._waiter_enq_ts[(name, holder_id)] = _now()  # track enqueue time
 
     def _remove_waiter(self, name: str, holder_id: str) -> None:
         with self._mu:
             q = self._waiters.get(name)
             if not q:
+                self._waiter_enq_ts.pop((name, holder_id), None)
                 return
             try:
                 q.remove(holder_id)
             except ValueError:
                 pass
+            finally:
+                self._waiter_enq_ts.pop((name, holder_id), None)
             if not q:
                 self._waiters.pop(name, None)
 
@@ -229,13 +218,60 @@ class LockManager:
             q = self._waiters.get(name)
             return bool(q and q[0] == holder_id)
 
-    def _pop_waiter_if_head(self, name: str, holder_id: str) -> None:
+    # NOTE: locked variant to avoid re-entrance deadlock
+    def _pop_waiter_if_head_locked(self, name: str, holder_id: str) -> None:
+        q = self._waiters.get(name)
+        if q and q[0] == holder_id:
+            q.pop(0)
+            self._waiter_enq_ts.pop((name, holder_id), None)
+        if q == []:
+            self._waiters.pop(name, None)
+
+    def _evict_stale_head_if_needed(self, name: str) -> None:
+        """If the head waiter appears stuck (likely died), evict it after a grace window."""
         with self._mu:
             q = self._waiters.get(name)
-            if q and q[0] == holder_id:
+            if not q:
+                return
+            head = q[0]
+            ts = self._waiter_enq_ts.get((name, head))
+            if ts is None:
+                # No timestamp? Evict conservatively.
                 q.pop(0)
-            if q == []:
-                self._waiters.pop(name, None)
+                self._waiter_enq_ts.pop((name, head), None)
+                if not q:
+                    self._waiters.pop(name, None)
+                return
+            if (_now() - ts) >= STALE_WAITER_S:
+                q.pop(0)
+                self._waiter_enq_ts.pop((name, head), None)
+                if not q:
+                    self._waiters.pop(name, None)
 
+    def _steal_if_dead_holder(self, name: str, head_holder_id: str, *, max_age_s: float) -> None:
+        """
+        When TTL is None (no automatic expiry) and the current holder appears dead or wedged,
+        allow the HEAD WAITER to forcibly steal after max_age_s. Preserves fairness.
+        """
+        if self.ttl_seconds is not None:
+            return  # normal TTL-based expiry/steal applies
+        now = _now()
+        with self._mu:
+            st = self._locks.get(name)
+            if st is None:
+                return
+            # Only the current head waiter gets to consider a steal
+            q = self._waiters.get(name)
+            if not q or q[0] != head_holder_id:
+                return
+            # If the holder is the same as head, acquire() would have succeeded. So holder is someone else.
+            age = now - st.acquired_at
+            if age >= float(max_age_s):
+                self._locks[name] = _LockState(holder=head_holder_id, acquired_at=now, renew_at=self._new_renew_at(now))
+                # We've taken the lock; drop our waiter head entry.
+                q.pop(0)
+                self._waiter_enq_ts.pop((name, head_holder_id), None)
+                if not q:
+                    self._waiters.pop(name, None)
 
 __all__ = ["LockManager"]
