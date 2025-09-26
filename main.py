@@ -8,6 +8,8 @@ from pathlib import Path
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 import json
 import threading
+from dataclasses import asdict, is_dataclass  # ← added
+import platform, shutil, subprocess  # ← added
 
 from watchdogs import Pulse, start_watchdogs
 from observability.metrics import serve_metrics
@@ -20,6 +22,11 @@ from memory.store.inmem import InMemoryStore
 from memory.memory_daemon import MemoryDaemon
 from memory.health import snapshot as memory_snapshot  # use the rich snapshot
 from memory.wal import flush as wal_flush
+
+# --- Goals subsystem imports (for the goals dashboard JSON feed) ---
+from goals.api import GoalsAPI  # ← added
+from goals.model import Goal  # ← added
+from goals.store import FileGoalsStore  # ← added
 
 # ---------- Metrics endpoint (Prometheus) ----------
 METRICS_PORT = 9100  # http://127.0.0.1:9100/metrics
@@ -49,6 +56,13 @@ MEMORY_DIST_DIR = Path(
     )
 ).resolve()
 
+GOALS_DIST_DIR = Path(  # ← added
+    os.environ.get(
+        "ORRIN_GOALS_DIST",
+        REPO_ROOT / "UI" / "goals-dashboard" / "dist",
+    )
+).resolve()
+
 def _require_dist(dist_dir: Path, ui_name: str) -> None:
     """Verify dist_dir/index.html exists, otherwise print a build hint relative to REPO_ROOT."""
     idx = dist_dir / "index.html"
@@ -70,9 +84,68 @@ def _require_dist(dist_dir: Path, ui_name: str) -> None:
             "  npm run build\n"
         )
 
+# ---------- NEW: resilient builder (auto npm/brew install + build, non-crashing) ----------
+def _ensure_ui_build(ui_name: str, dist_dir: Path) -> bool:
+    """
+    Ensure a Vite UI 'dist/index.html' exists.
+    If missing, attempt: npm ci (or npm install) + npm run build.
+    On macOS, if npm is missing, try 'brew install node' once.
+    Returns True if dist is present (already or after build), else False.
+    """
+    idx = dist_dir / "index.html"
+    print(f"[{ui_name}] using dist_dir: {dist_dir}")
+    print(f"[{ui_name}] dist_dir exists: {dist_dir.exists()}  index.html exists: {idx.exists()}")
+
+    if idx.exists():
+        return True
+
+    # Try to build
+    ui_src_dir = dist_dir.parent  # e.g., UI/goals-dashboard
+    print(f"[{ui_name}] dist missing → attempting local build in {ui_src_dir}")
+
+    def _run(cmd: list[str]) -> bool:
+        try:
+            print(f"[{ui_name}] $ {' '.join(cmd)}")
+            subprocess.run(cmd, cwd=str(ui_src_dir), check=True)
+            return True
+        except Exception as e:
+            print(f"[{ui_name}] command failed: {e}")
+            return False
+
+    npm = shutil.which("npm")
+
+    # If npm absent, try to install Node via Homebrew on macOS, then re-detect npm
+    if npm is None and platform.system() == "Darwin":
+        brew = shutil.which("brew")
+        if brew:
+            print(f"[{ui_name}] npm not found → trying 'brew install node'")
+            _run([brew, "install", "node"])
+            npm = shutil.which("npm")
+
+    if npm is None:
+        print(f"[{ui_name}] npm not found and could not auto-install. "
+              f"Please install Node.js, then run: cd {ui_src_dir} && npm install && npm run build")
+        return False
+
+    # Install deps (prefer ci; fall back to install)
+    if not _run([npm, "ci"]):
+        if not _run([npm, "install"]):
+            print(f"[{ui_name}] npm install failed.")
+            return False
+
+    # Build
+    if not _run([npm, "run", "build"]):
+        print(f"[{ui_name}] build failed.")
+        return False
+
+    ok = idx.exists()
+    print(f"[{ui_name}] build result index.html exists: {ok}")
+    return ok
+
 # ---------- Ports ----------
-DASH_PORT     = int(os.environ.get("ORRIN_DASH_PORT", "9310"))    # metrics UI
-MEM_DASH_PORT = int(os.environ.get("ORRIN_MEM_DASH_PORT", "9400"))  # memory UI
+DASH_PORT       = int(os.environ.get("ORRIN_DASH_PORT", "9310"))      # metrics UI
+MEM_DASH_PORT   = int(os.environ.get("ORRIN_MEM_DASH_PORT", "9400"))  # memory UI
+GOALS_DASH_PORT = int(os.environ.get("ORRIN_GOALS_DASH_PORT", "9500"))  # ← goals UI
 
 # ---------- Helper: simple memory dashboard server (fallback if needed) ----------
 def start_memory_server(dist_dir: str, port: int, memory_health_provider):
@@ -107,17 +180,84 @@ def start_memory_server(dist_dir: str, port: int, memory_health_provider):
     url = f"http://127.0.0.1:{port}/"
     return t, httpd, url
 
+# ---------- Helper: goals JSON encoding + provider (for the goals dashboard) ----------
+# Where goals data (JSONL/WAL) lives — matches CLI default unless overridden
+GOALS_DATA_DIR = Path(os.environ.get("ORRIN_GOALS_DIR", REPO_ROOT / "data" / "goals")).resolve()
+GOALS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+_goal_store = FileGoalsStore(data_dir=GOALS_DATA_DIR)  # ← fixed
+_goals_api = GoalsAPI(store=_goal_store)
+
+def _goal_to_jsonable(g: Goal) -> dict:
+    d = g.__dict__.copy()
+    # enums -> names
+    d["status"] = getattr(g.status, "name", str(g.status))
+    d["priority"] = getattr(g.priority, "name", str(g.priority))
+    # datetimes -> ISO
+    if d.get("deadline"):    d["deadline"]    = g.deadline.isoformat()
+    if d.get("created_at"):  d["created_at"]  = g.created_at.isoformat()
+    if d.get("updated_at"):  d["updated_at"]  = g.updated_at.isoformat()
+    # dataclass progress -> dict
+    pr = d.get("progress")
+    if is_dataclass(pr):
+        d["progress"] = asdict(pr)
+    # normalize mapping types
+    if d.get("acceptance") is not None:
+        d["acceptance"] = dict(d["acceptance"])
+    if d.get("spec") is not None:
+        d["spec"] = dict(d["spec"])
+    return d
+
+def get_goals_json():
+    # Extend with filters later if needed (?status=, ?priority=, etc.)
+    goals = _goals_api.list_goals()
+    return [_goal_to_jsonable(g) for g in goals]
+
+# ---------- Helper: simple goals dashboard server ----------
+def start_goals_server(dist_dir: str, port: int, goals_provider):
+    """Serve static SPA from dist_dir and expose GET /goals and /goals.json."""
+    class Handler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=dist_dir, **kwargs)
+
+        def _send_json(self, obj, code=200):
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in ("/goals", "/goals.json"):
+                try:
+                    data = goals_provider() or []
+                    self._send_json(data, 200)
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+            return super().do_GET()
+
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    t = threading.Thread(target=httpd.serve_forever, name=f"goals-ui:{port}", daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{port}/"
+    return t, httpd, url
+
 # ---------- Start Metrics Dashboard ----------
 dash_thread = dash_httpd = None
 try:
-    _require_dist(METRICS_DIST_DIR, "dashboard")
-    dash_thread, dash_httpd, dash_url = start_dashboard_server(
-        dist_dir=str(METRICS_DIST_DIR),
-        port=DASH_PORT,
-        metrics_upstream=f"http://127.0.0.1:{METRICS_PORT}/metrics",
-        open_browser=True,  # auto-open metrics tab
-    )
-    print(f"[dashboard] serving at {dash_url}")
+    if _ensure_ui_build("dashboard", METRICS_DIST_DIR):
+        dash_thread, dash_httpd, dash_url = start_dashboard_server(
+            dist_dir=str(METRICS_DIST_DIR),
+            port=DASH_PORT,
+            metrics_upstream=f"http://127.0.0.1:{METRICS_PORT}/metrics",
+            open_browser=True,  # auto-open metrics tab
+        )
+        print(f"[dashboard] serving at {dash_url}")
+    else:
+        print("[dashboard] skipped (dist not available)")
 except Exception as e:
     print(f"[dashboard] not started: {e}")
 
@@ -224,29 +364,50 @@ def get_memory_health():
 # ---------- Start Memory Dashboard (with fallback if server lacks memory_health_provider) ----------
 mem_dash_thread = mem_dash_httpd = None
 try:
-    _require_dist(MEMORY_DIST_DIR, "memory-dashboard")
-    try:
-        # Preferred: server supports /memory via memory_health_provider
-        mem_dash_thread, mem_dash_httpd, mem_dash_url = start_dashboard_server(
-            dist_dir=str(MEMORY_DIST_DIR),
-            port=MEM_DASH_PORT,
-            metrics_upstream=f"http://127.0.0.1:{METRICS_PORT}/metrics",
-            memory_health_provider=get_memory_health,  # serve /memory here
-            open_browser=True,
-        )
-        print("[memory-dashboard] /memory endpoint wired via memory_health_provider")
-    except TypeError:
-        # Fallback: our small server that always exposes /memory
-        print("[memory-dashboard] start_dashboard_server lacks memory_health_provider → using fallback server")
-        mem_dash_thread, mem_dash_httpd, mem_dash_url = start_memory_server(
-            dist_dir=str(MEMORY_DIST_DIR),
-            port=MEM_DASH_PORT,
-            memory_health_provider=get_memory_health,
-        )
-        webbrowser.open(mem_dash_url)
-    print(f"[memory-dashboard] serving at {mem_dash_url}")
+    if _ensure_ui_build("memory-dashboard", MEMORY_DIST_DIR):
+        try:
+            # Preferred: server supports /memory via memory_health_provider
+            mem_dash_thread, mem_dash_httpd, mem_dash_url = start_dashboard_server(
+                dist_dir=str(MEMORY_DIST_DIR),
+                port=MEM_DASH_PORT,
+                metrics_upstream=f"http://127.0.0.1:{METRICS_PORT}/metrics",
+                memory_health_provider=get_memory_health,  # serve /memory here
+                open_browser=True,
+            )
+            print("[memory-dashboard] /memory endpoint wired via memory_health_provider")
+        except TypeError:
+            # Fallback: our small server that always exposes /memory
+            print("[memory-dashboard] start_dashboard_server lacks memory_health_provider → using fallback server")
+            mem_dash_thread, mem_dash_httpd, mem_dash_url = start_memory_server(
+                dist_dir=str(MEMORY_DIST_DIR),
+                port=MEM_DASH_PORT,
+                memory_health_provider=get_memory_health,
+            )
+            webbrowser.open(mem_dash_url)
+        print(f"[memory-dashboard] serving at {mem_dash_url}")
+    else:
+        print("[memory-dashboard] skipped (dist not available)")
 except Exception as e:
     print(f"[memory-dashboard] not started: {e}")
+
+# ---------- Start Goals Dashboard ----------
+goals_thread = goals_httpd = None
+try:
+    if _ensure_ui_build("goals-dashboard", GOALS_DIST_DIR):
+        goals_thread, goals_httpd, goals_url = start_goals_server(
+            dist_dir=str(GOALS_DIST_DIR),
+            port=GOALS_DASH_PORT,
+            goals_provider=get_goals_json,
+        )
+        try:
+            webbrowser.open(goals_url)
+        except Exception:
+            pass
+        print(f"[goals-dashboard] serving at {goals_url}")
+    else:
+        print("[goals-dashboard] skipped (dist not available)")
+except Exception as e:
+    print(f"[goals-dashboard] not started: {e}")
 
 # ---------- Watchdogs ----------
 pulse = Pulse()
@@ -338,6 +499,11 @@ def run() -> None:
         if mem_dash_httpd is not None:
             try:
                 mem_dash_httpd.shutdown()
+            except Exception:
+                pass
+        if goals_httpd is not None:  # ← added
+            try:
+                goals_httpd.shutdown()
             except Exception:
                 pass
 
